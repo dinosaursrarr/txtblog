@@ -4,17 +4,27 @@ import (
 	"flag"
 	"fmt"
 	"html/template"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+
+	"github.com/fsnotify/fsnotify"
 )
 
 type Post struct {
 	Filename string
+	Content  string
 	Preview  string
+}
+
+type Store struct {
+	sync.RWMutex
+	posts map[string]Post
 }
 
 type PageData struct {
@@ -73,57 +83,136 @@ const tpl = `<!DOCTYPE html>
 </body>
 </html>`
 
+func NewStore() *Store {
+	return &Store{posts: make(map[string]Post)}
+}
+
+func (s *Store) LoadDir(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+
+	s.Lock()
+	defer s.Unlock()
+
+	clear(s.posts)
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".txt") {
+			continue
+		}
+		s.loadSingleFile(dir, entry.Name())
+	}
+	return nil
+}
+
+func (s *Store) loadSingleFile(dir, filename string) {
+	data, err := os.ReadFile(filepath.Join(dir, filename))
+	if err != nil {
+		delete(s.posts, filename)
+		return
+	}
+	content := string(data)
+	preview := content
+	if len(preview) > 300 {
+		preview = preview[:300] + "..."
+	}
+	s.posts[filename] = Post{
+		Filename: filename,
+		Content:  content,
+		Preview:  preview,
+	}
+}
+
+func (s *Store) UpdateFile(dir, filename string) {
+	s.Lock()
+	defer s.Unlock()
+	s.loadSingleFile(dir, filename)
+}
+
+func (s *Store) RemoveFile(filename string) {
+	s.Lock()
+	defer s.Unlock()
+	delete(s.posts, filename)
+}
+
+func (s *Store) Search(query string) []Post {
+	s.RLock()
+	defer s.RUnlock()
+
+	q := strings.ToLower(query)
+	var filtered []Post
+	for _, post := range s.posts {
+		if q == "" || strings.Contains(strings.ToLower(post.Filename), q) || strings.Contains(strings.ToLower(post.Content), q) {
+			filtered = append(filtered, post)
+		}
+	}
+
+	sort.Slice(filtered, func(i, j int) bool {
+		return filtered[i].Filename > filtered[j].Filename
+	})
+
+	return filtered
+}
+
 func main() {
 	port := flag.String("port", "8080", "Port to listen on")
 	dir := flag.String("dir", ".", "Path to folder with .txt files")
 	pageSize := flag.Int("size", 20, "Number of posts per page")
 	flag.Parse()
 
+	store := NewStore()
+	if err := store.LoadDir(*dir); err != nil {
+		log.Fatalf("Failed to initial scan directory: %v", err)
+	}
+
+	// File watcher setup (kqueue on FreeBSD)
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		log.Fatalf("Failed to initialize fsnotify: %v", err)
+	}
+	defer watcher.Close()
+
+	go func() {
+		for {
+			select {
+			case event, ok := <-watcher.Events:
+				if !ok {
+					return
+				}
+				if !strings.HasSuffix(event.Name, ".txt") {
+					continue
+				}
+				filename := filepath.Base(event.Name)
+
+				if event.Op&(fsnotify.Write|fsnotify.Create) != 0 {
+					store.UpdateFile(*dir, filename)
+				} else if event.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
+					store.RemoveFile(filename)
+				}
+			case err, ok := <-watcher.Errors:
+				if !ok {
+					return
+				}
+				log.Println("Watcher error:", err)
+			}
+		}
+	}()
+
+	if err := watcher.Add(*dir); err != nil {
+		log.Fatalf("Failed to watch directory %s: %v", *dir, err)
+	}
+
 	t := template.Must(template.New("web").Parse(tpl))
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		rawQuery := r.URL.Query().Get("q")
-		query := strings.ToLower(rawQuery)
-		
 		page, _ := strconv.Atoi(r.URL.Query().Get("page"))
 		if page < 1 {
 			page = 1
 		}
 
-		entries, err := os.ReadDir(*dir)
-		if err != nil {
-			http.Error(w, "Unable to read directory", 500)
-			return
-		}
-
-		// Sort newest-first by filename descending
-		sort.Slice(entries, func(i, j int) bool {
-			return entries[i].Name() > entries[j].Name()
-		})
-
-		var filtered []Post
-		for _, entry := range entries {
-			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".txt") {
-				continue
-			}
-
-			data, err := os.ReadFile(filepath.Join(*dir, entry.Name()))
-			if err != nil {
-				continue
-			}
-			content := string(data)
-
-			nameMatch := strings.Contains(strings.ToLower(entry.Name()), query)
-			contentMatch := strings.Contains(strings.ToLower(content), query)
-
-			if query == "" || nameMatch || contentMatch {
-				preview := content
-				if len(preview) > 300 {
-					preview = preview[:300] + "..."
-				}
-				filtered = append(filtered, Post{Filename: entry.Name(), Preview: preview})
-			}
-		}
+		filtered := store.Search(rawQuery)
 
 		totalCount := len(filtered)
 		totalPages := (totalCount + *pageSize - 1) / *pageSize
@@ -161,10 +250,20 @@ func main() {
 
 	http.HandleFunc("/raw", func(w http.ResponseWriter, r *http.Request) {
 		name := filepath.Base(r.URL.Query().Get("name"))
-		http.ServeFile(w, r, filepath.Join(*dir, name))
+		store.RLock()
+		post, ok := store.posts[name]
+		store.RUnlock()
+
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Write([]byte(post.Content))
 	})
 
-	fmt.Printf("Serving text blog on http://localhost:%s\n", *port)
-	http.ListenAndServe(":"+*port, nil)
+	fmt.Printf("Serving in-memory text blog from %s on http://localhost:%s\n", *dir, *port)
+	log.Fatal(http.ListenAndServe(":"+*port, nil))
 }
 
