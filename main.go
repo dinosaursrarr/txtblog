@@ -108,7 +108,7 @@ func (s *Store) LoadDir(dir string) error {
 		if len(preview) > 300 {
 			preview = preview[:300] + "..."
 		}
-		s.posts[filename] = Post{
+		newPosts[filename] = Post{
 			Filename: filename,
 			Content:  content,
 			Preview:  preview,
