@@ -12,8 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-
-	"github.com/fsnotify/fsnotify"
+	"time"
 )
 
 type Post struct {
@@ -59,7 +58,7 @@ const tpl = `<!DOCTYPE html>
     <form method="GET">
         <input type="text" name="q" placeholder="Search filenames or full text..." value="{{.Query}}">
     </form>
-    
+
     <div class="meta">Found {{.TotalCount}} file(s) — Page {{.CurrentPage}} of {{.TotalPages}}</div>
 
     {{range .Posts}}
@@ -93,47 +92,33 @@ func (s *Store) LoadDir(dir string) error {
 		return err
 	}
 
-	s.Lock()
-	defer s.Unlock()
-
-	clear(s.posts)
+	newPosts := make(map[string]Post)
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".txt") {
+		filename := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(filename, ".txt") {
 			continue
 		}
-		s.loadSingleFile(dir, entry.Name())
+
+		data, err := os.ReadFile(filepath.Join(dir, filename))
+		if err != nil {
+			continue
+		}
+		content := string(data)
+		preview := content
+		if len(preview) > 300 {
+			preview = preview[:300] + "..."
+		}
+		s.posts[filename] = Post{
+			Filename: filename,
+			Content:  content,
+			Preview:  preview,
+		}
 	}
+
+	s.Lock()
+	s.posts = newPosts
+	s.Unlock()
 	return nil
-}
-
-func (s *Store) loadSingleFile(dir, filename string) {
-	data, err := os.ReadFile(filepath.Join(dir, filename))
-	if err != nil {
-		delete(s.posts, filename)
-		return
-	}
-	content := string(data)
-	preview := content
-	if len(preview) > 300 {
-		preview = preview[:300] + "..."
-	}
-	s.posts[filename] = Post{
-		Filename: filename,
-		Content:  content,
-		Preview:  preview,
-	}
-}
-
-func (s *Store) UpdateFile(dir, filename string) {
-	s.Lock()
-	defer s.Unlock()
-	s.loadSingleFile(dir, filename)
-}
-
-func (s *Store) RemoveFile(filename string) {
-	s.Lock()
-	defer s.Unlock()
-	delete(s.posts, filename)
 }
 
 func (s *Store) Search(query string) []Post {
@@ -159,49 +144,27 @@ func main() {
 	port := flag.String("port", "8080", "Port to listen on")
 	dir := flag.String("dir", ".", "Path to folder with .txt files")
 	pageSize := flag.Int("size", 20, "Number of posts per page")
+	pollInterval := flag.Duration("poll", 2*time.Minute, "Directory refresh interval (e.g. 30s, 2m)")
 	flag.Parse()
+
+	if *pollInterval <= 0 {
+		log.Fatalf("Poll interval not set to a positive number")
+	}
 
 	store := NewStore()
 	if err := store.LoadDir(*dir); err != nil {
 		log.Fatalf("Failed to initial scan directory: %v", err)
 	}
 
-	// File watcher setup (kqueue on FreeBSD)
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		log.Fatalf("Failed to initialize fsnotify: %v", err)
-	}
-	defer watcher.Close()
-
 	go func() {
-		for {
-			select {
-			case event, ok := <-watcher.Events:
-				if !ok {
-					return
-				}
-				if !strings.HasSuffix(event.Name, ".txt") {
-					continue
-				}
-				filename := filepath.Base(event.Name)
-
-				if event.Op&(fsnotify.Write|fsnotify.Create) != 0 {
-					store.UpdateFile(*dir, filename)
-				} else if event.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
-					store.RemoveFile(filename)
-				}
-			case err, ok := <-watcher.Errors:
-				if !ok {
-					return
-				}
-				log.Println("Watcher error:", err)
+		ticker := time.NewTicker(*pollInterval)
+		defer ticker.Stop()
+		for range ticker.C {
+			if err := store.LoadDir(*dir); err != nil {
+				log.Printf("Error reloading directory %s: %v", *dir, err)
 			}
 		}
 	}()
-
-	if err := watcher.Add(*dir); err != nil {
-		log.Fatalf("Failed to watch directory %s: %v", *dir, err)
-	}
 
 	t := template.Must(template.New("web").Parse(tpl))
 
@@ -266,4 +229,3 @@ func main() {
 	fmt.Printf("Serving in-memory text blog from %s on http://localhost:%s\n", *dir, *port)
 	log.Fatal(http.ListenAndServe(":"+*port, nil))
 }
-
